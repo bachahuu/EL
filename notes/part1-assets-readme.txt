@@ -1,0 +1,1 @@
+Part 1 image/audio assets are managed separately from question text. The web app renders image_url and media URLs from Supabase.
