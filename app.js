@@ -5,9 +5,12 @@ const LETTERS = ['A', 'B', 'C', 'D'];
 
 const app = document.querySelector('#app');
 let bank = [];
+let mediaBank = [];
 let currentSession = null;
 
-const state = { view: 'home' };
+const state = {
+  view: 'home',
+};
 
 function shuffle(items) {
   const arr = [...items];
@@ -29,10 +32,16 @@ function escapeHtml(value = '') {
 
 async function loadQuestions() {
   app.innerHTML = document.querySelector('#loading-template').innerHTML;
-  const url = `${SUPABASE_URL}/rest/v1/${TABLE}?select=*&order=part.asc,set_no.asc,question_number.asc`;
-  const response = await fetch(url, { headers: { apikey: SUPABASE_KEY, Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`Supabase ${response.status}: ${await response.text()}`);
-  bank = await response.json();
+  const headers = { apikey: SUPABASE_KEY, Accept: 'application/json' };
+  const questionUrl = `${SUPABASE_URL}/rest/v1/${TABLE}?select=*&order=part.asc,set_no.asc,question_number.asc`;
+  const mediaUrl = `${SUPABASE_URL}/rest/v1/toeic_set_media?select=*&order=part.asc,set_no.asc`;
+  const [questionResponse, mediaResponse] = await Promise.all([
+    fetch(questionUrl, { headers }),
+    fetch(mediaUrl, { headers }),
+  ]);
+  if (!questionResponse.ok) throw new Error(`Supabase ${questionResponse.status}: ${await questionResponse.text()}`);
+  bank = await questionResponse.json();
+  mediaBank = mediaResponse.ok ? await mediaResponse.json() : [];
   renderHome();
 }
 
@@ -119,10 +128,86 @@ function normalizeQuestion(row) {
     setNo: row.set_no,
     originalNumber: row.question_number,
     text: row.question_text,
+    imageUrl: row.image_url || derivePart1ImagePath(row),
+    mediaSetKey: row.media_set_key || null,
     options: shuffled,
     correctDisplay: correct?.display,
     answer: null,
   };
+}
+
+function derivePart1ImagePath(row) {
+  if (Number(row.part) !== 1 || ![2, 3].includes(Number(row.set_no))) return null;
+  return `assets/part1/set${row.set_no}/q${row.question_number}.b64`;
+}
+
+function getSessionSet(session) {
+  if (!session?.questions?.length) return null;
+  const first = session.questions[0];
+  const sameSet = session.questions.every(q => q.part === first.part && q.setNo === first.setNo);
+  return sameSet ? { part: first.part, setNo: first.setNo } : null;
+}
+
+function getSetMedia(part, setNo) {
+  return mediaBank.find(m => Number(m.part) === Number(part) && Number(m.set_no) === Number(setNo)) || null;
+}
+
+function renderSessionMedia(session) {
+  const set = getSessionSet(session);
+  if (!set) return '';
+  const media = getSetMedia(set.part, set.setNo);
+  let src = media?.public_url || null;
+  if (!src && Number(set.part) === 1 && Number(set.setNo) === 1) {
+    src = 'assets/part1/set1/audio-manifest.json';
+  }
+  if (!src) return '';
+  const isManifest = src.endsWith('.json');
+  return `<div class="media-panel">
+    <div class="media-copy"><strong>🎧 Audio Part ${set.part}-${set.setNo}</strong><span>Nghe audio của đúng bộ câu hỏi này.</span></div>
+    <audio class="set-audio" controls preload="metadata" ${isManifest ? `data-audio-manifest="${escapeHtml(src)}"` : `src="${escapeHtml(src)}"`}></audio>
+  </div>`;
+}
+
+async function hydrateMedia() {
+  const imageEls = [...document.querySelectorAll('img[data-b64-url]')];
+  await Promise.all(imageEls.map(async img => {
+    const path = img.dataset.b64Url;
+    try {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const b64 = (await response.text()).trim();
+      img.src = `data:image/jpeg;base64,${b64}`;
+      img.classList.add('loaded');
+    } catch (err) {
+      console.warn('Không tải được ảnh', path, err);
+      img.closest('.question-visual')?.classList.add('media-error');
+    }
+  }));
+
+  const audios = [...document.querySelectorAll('audio[data-audio-manifest]')];
+  await Promise.all(audios.map(async audio => {
+    const manifestPath = audio.dataset.audioManifest;
+    try {
+      const manifestResponse = await fetch(manifestPath);
+      if (!manifestResponse.ok) throw new Error(`HTTP ${manifestResponse.status}`);
+      const manifest = await manifestResponse.json();
+      const base = new URL(manifestPath, document.baseURI);
+      const chunks = await Promise.all((manifest.chunks || []).map(async name => {
+        const response = await fetch(new URL(name, base));
+        if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+        return (await response.text()).trim();
+      }));
+      const binary = atob(chunks.join(''));
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: manifest.mime || 'audio/ogg' });
+      audio.src = URL.createObjectURL(blob);
+      audio.dataset.ready = 'true';
+    } catch (err) {
+      console.warn('Không tải được audio', manifestPath, err);
+      audio.insertAdjacentHTML('afterend', '<small class="media-warning">Audio chưa tải được. Hãy Ctrl+F5 và thử lại.</small>');
+    }
+  }));
 }
 
 function createSession(rows, mode, label) {
@@ -166,6 +251,7 @@ function renderQuiz() {
         <button class="btn ghost" data-action="home">Thoát</button>
       </div>
       <div class="quiz-main">
+        ${renderSessionMedia(s)}
         ${s.questions.map((q,i) => renderQuestion(q,i,s.submitted)).join('')}
       </div>
       <aside class="quiz-sidebar">
@@ -191,6 +277,7 @@ function renderQuiz() {
       </aside>
     </section>
   `;
+  hydrateMedia();
 }
 
 function renderQuestion(q, index, submitted) {
@@ -199,6 +286,7 @@ function renderQuestion(q, index, submitted) {
       <span class="question-number">Câu ${index + 1}</span>
       <span>Part ${q.part} · Bộ ${q.setNo} · mã gốc #${q.originalNumber}</span>
     </div>
+    ${q.imageUrl ? `<div class="question-visual"><img class="question-image" alt="Ảnh câu ${index + 1}" data-b64-url="${escapeHtml(q.imageUrl)}"></div>` : ''}
     <h2 class="question-text">${escapeHtml(q.text)}</h2>
     <div class="options">
       ${q.options.map(opt => {
